@@ -375,6 +375,7 @@ fn parse_bash_lc_commands(
                 // Strip small formatting helpers (e.g., head/tail/awk/wc/etc) so we
                 // bias toward the primary command when pipelines are present.
                 // First, drop obvious small formatting helpers (e.g., wc/awk/etc).
+                let had_multiple_commands = all_commands.len() > 1;
                 let filtered_commands = drop_small_formatting_commands(all_commands);
                 if filtered_commands.is_empty() {
                     return Some(vec![ParsedCommand::Unknown {
@@ -383,13 +384,7 @@ fn parse_bash_lc_commands(
                 }
                 let mut commands: Vec<ParsedCommand> = filtered_commands
                     .into_iter()
-                    .map(|tokens| match summarize_main_tokens(&tokens) {
-                        ParsedCommand::Ls { path, .. } => ParsedCommand::Ls {
-                            cmd: script_tokens.clone(),
-                            path,
-                        },
-                        other => other,
-                    })
+                    .map(|tokens| summarize_main_tokens(&tokens))
                     .collect();
                 commands = maybe_collapse_cat_sed(commands, &script_tokens);
                 if commands.len() == 1 {
@@ -397,20 +392,45 @@ fn parse_bash_lc_commands(
                     // for clearer UX in file-reading and listing scenarios, or when there were
                     // no connectors in the original script. For search commands that came from
                     // a pipeline (e.g. `rg --files | sed -n`), keep only the primary command.
-                    let had_connectors = script_tokens
-                        .iter()
-                        .any(|t| t == "|" || t == "&&" || t == "||" || t == ";");
+                    let had_connectors = had_multiple_commands
+                        || script_tokens
+                            .iter()
+                            .any(|t| t == "|" || t == "&&" || t == "||" || t == ";");
                     commands = commands
                         .into_iter()
                         .map(|pc| match pc {
-                            ParsedCommand::Read { name, .. } => ParsedCommand::Read {
-                                cmd: script_tokens.clone(),
-                                name,
-                            },
-                            ParsedCommand::Ls { path, .. } => ParsedCommand::Ls {
-                                cmd: script_tokens.clone(),
-                                path,
-                            },
+                            ParsedCommand::Read { name, cmd } => {
+                                if had_connectors {
+                                    let has_pipe = script_tokens.iter().any(|t| t == "|");
+                                    let has_sed_n = script_tokens.windows(2).any(|w| {
+                                        w.first().map(|s| s.as_str()) == Some("sed")
+                                            && w.get(1).map(|s| s.as_str()) == Some("-n")
+                                    });
+                                    if has_pipe && has_sed_n {
+                                        ParsedCommand::Read {
+                                            cmd: script_tokens.clone(),
+                                            name,
+                                        }
+                                    } else {
+                                        ParsedCommand::Read { cmd, name }
+                                    }
+                                } else {
+                                    ParsedCommand::Read {
+                                        cmd: script_tokens.clone(),
+                                        name,
+                                    }
+                                }
+                            }
+                            ParsedCommand::Ls { path, cmd } => {
+                                if had_connectors {
+                                    ParsedCommand::Ls { cmd, path }
+                                } else {
+                                    ParsedCommand::Ls {
+                                        cmd: script_tokens.clone(),
+                                        path,
+                                    }
+                                }
+                            }
                             ParsedCommand::Search {
                                 cmd,
                                 query,
@@ -539,28 +559,7 @@ fn maybe_collapse_cat_sed(
 
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
     match main_cmd.split_first() {
-        // sed -n '<range>' <file> | ...  -> treat as a search targeting <file>.
-        // This is commonly used with `nl -ba` in a pipeline for line numbering.
-        Some((head, tail)) if head == "sed" => {
-            if tail.get(0).map(|s| s.as_str()) == Some("-n")
-                && is_valid_sed_n_arg(tail.get(1).map(|s| s.as_str()))
-                && tail.len() >= 3
-            {
-                // Use the last non-flag argument as the file operand.
-                let file = tail.iter().rev().find(|s| !s.starts_with('-')).cloned();
-                if let Some(p) = file {
-                    return ParsedCommand::Search {
-                        cmd: main_cmd.to_vec(),
-                        query: None,
-                        path: Some(short_display_path(&p)),
-                        files_only: false,
-                    };
-                }
-            }
-            ParsedCommand::Unknown {
-                cmd: main_cmd.to_vec(),
-            }
-        }
+        // (sed-specific logic handled below in dedicated arm returning Read)
         Some((head, tail)) if head == "nl" => {
             let path = tail.iter().find(|p| !p.starts_with('-'));
             if let Some(p) = path {
@@ -954,7 +953,7 @@ mod tests {
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
             vec![ParsedCommand::Ls {
-                cmd: shlex_split(inner).unwrap(),
+                cmd: vec_str(&["ls", "-la"]),
                 path: None,
             }],
         );
@@ -1411,13 +1410,25 @@ mod tests {
     }
 
     #[test]
+    fn supports_sed_n() {
+        let inner = "sed -n '2000,2200p' tui/src/history_cell.rs";
+        assert_parsed(
+            &vec_str(&["bash", "-lc", inner]),
+            vec![ParsedCommand::Read {
+                cmd: shlex_split(inner).unwrap(),
+                name: "history_cell.rs".to_string(),
+            }],
+        );
+    }
+
+    #[test]
     fn filters_out_printf() {
         let inner =
             r#"printf "\n===== ansi-escape/Cargo.toml =====\n"; cat -- ansi-escape/Cargo.toml"#;
         assert_parsed(
             &vec_str(&["bash", "-lc", inner]),
             vec![ParsedCommand::Read {
-                cmd: shlex_split(inner).unwrap(),
+                cmd: vec_str(&["cat", "--", "ansi-escape/Cargo.toml"]),
                 name: "Cargo.toml".to_string(),
             }],
         );
@@ -1452,16 +1463,14 @@ mod tests {
         ]);
         assert_parsed(
             &args,
-            vec![ParsedCommand::Search {
+            vec![ParsedCommand::Read {
                 cmd: vec_str(&[
                     "sed",
                     "-n",
                     "260,640p",
                     "exec/src/event_processor_with_human_output.rs",
                 ]),
-                query: None,
-                path: Some("event_processor_with_human_output.rs".to_string()),
-                files_only: false,
+                name: "event_processor_with_human_output.rs".to_string(),
             }],
         );
     }

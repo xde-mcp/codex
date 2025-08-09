@@ -269,7 +269,7 @@ impl HistoryCell {
         command: Vec<String>,
         parsed: Vec<ParsedCommand>,
     ) -> Self {
-        let lines = HistoryCell::exec_command_lines(&command, &parsed,None);
+        let lines = HistoryCell::exec_command_lines(&command, &parsed, None);
         HistoryCell::ActiveExecCommand {
             view: TextBlock::new(lines),
         }
@@ -337,7 +337,7 @@ impl HistoryCell {
             })
             .collect();
 
-        let mut lines: Vec<Line> = vec![Line::from("📖 Read")];
+        let mut lines: Vec<Line> = vec![Line::from("📖 Reading")];
 
         for name in file_names {
             lines.push(Line::from(vec![
@@ -363,11 +363,7 @@ impl HistoryCell {
             })
             .collect();
 
-        let mut lines: Vec<Line> = vec![];
-        match output {
-            Some(_) => lines.push(Line::from("📂 Explored")),
-            None => lines.push(Line::from("📂 Exploring")),
-        }
+        let mut lines: Vec<Line> = vec![Line::from("📂 Listing")];
 
         for name in paths {
             lines.push(Line::from(vec![
@@ -385,6 +381,7 @@ impl HistoryCell {
         search_commands: &[ParsedCommand],
         output: Option<&CommandOutput>,
     ) -> Vec<Line<'static>> {
+        tracing::error!("[GABE] new_search_command {:?}", search_commands);
         let file_names: HashSet<&String> = search_commands
             .iter()
             .flat_map(|c| match c {
@@ -393,27 +390,28 @@ impl HistoryCell {
             })
             .collect();
 
-        let count = file_names.len();
-        let mut lines: Vec<Line> = vec![];
+        let mut lines: Vec<Line> = vec![Line::from("🔎 Searching")];
 
-        lines.push(match output {
-            Some(_) => match count {
-                0 => Line::from("🔎 Searched files"),
-                1 => Line::from("🔎 Searched for 1 file"),
-                _ => Line::from(format!("🔎 Searched for {count} files")),
-            },
-            None => match count {
-                0 => Line::from("🔎 Searching files"),
-                1 => Line::from("🔎 Searching 1 file"),
-                _ => Line::from(format!("🔎 Searching {count} files")),
-            },
-        });
-
-        for name in file_names {
-            lines.push(Line::from(vec![
-                Span::styled("  L ", Style::default().fg(Color::Gray)),
-                Span::styled(name.clone(), Style::default().fg(LIGHT_BLUE)),
-            ]));
+        match file_names.len() {
+            0 => {
+                // We couldn't extract names from the cmd so display the raw cmd.
+                for cmd in search_commands {
+                    if let ParsedCommand::Search { cmd, .. } = cmd {
+                        lines.push(Line::from(vec![
+                            Span::styled("  L ", Style::default().fg(Color::Gray)),
+                            Span::styled(cmd.join(" "), Style::default().fg(LIGHT_BLUE)),
+                        ]));
+                    }
+                }
+            }
+            _ => {
+                for name in file_names {
+                    lines.push(Line::from(vec![
+                        Span::styled("  L ", Style::default().fg(Color::Gray)),
+                        Span::styled(name.clone(), Style::default().fg(LIGHT_BLUE)),
+                    ]));
+                }
+            }
         }
         lines.extend(output_lines(output, true, false));
         lines.push(Line::from(""));
@@ -444,19 +442,7 @@ impl HistoryCell {
             }
         }
 
-        let count = targets.len();
-        let mut lines: Vec<Line> = vec![match output {
-            Some(_) => match count {
-                0 => Line::from("✨ Formatted code"),
-                1 => Line::from("✨ Formatted 1 target"),
-                _ => Line::from(format!("✨ Formatted {count} targets")),
-            },
-            None => match count {
-                0 => Line::from("✨ Formatting code"),
-                1 => Line::from("✨ Formatting 1 target"),
-                _ => Line::from(format!("✨ Formatting {count} targets")),
-            },
-        }];
+        let mut lines: Vec<Line> = vec![Line::from("✨ Formatting")];
 
         if !tools.is_empty() {
             let mut first = true;
@@ -554,14 +540,23 @@ impl HistoryCell {
             }
         }
 
+        if filters.is_empty() {
+            for c in test_commands {
+                if let ParsedCommand::Test { cmd, .. } = c {
+                    filters.insert(cmd.join(" "));
+                }
+            }
+        }
+
         let mut runners_vec: Vec<String> = runners.into_iter().collect();
         runners_vec.sort();
-        let runners_str = formatted_list_str(runners_vec, "tests");
-        let mut lines: Vec<Line> = vec![];
-        match output {
-            Some(_) => lines.push(Line::from(format!("🧪 Ran tests with {runners_str}"))),
-            None => lines.push(Line::from(format!("🧪 Running tests with {runners_str}"))),
-        }
+        let mut lines: Vec<Line> = vec![match runners_vec.len() {
+            0 => Line::from("🧪 Testing"),
+            _ => Line::from(format!(
+                "🧪 Testing with {}",
+                formatted_list_str(runners_vec)
+            )),
+        }];
 
         let mut first = true;
         for f in filters.into_iter().take(10) {
@@ -592,17 +587,13 @@ impl HistoryCell {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let command_escaped = strip_bash_lc_and_escape(command);
         let mut cmd_lines = command_escaped.lines();
-        let running_str = match output {
-            Some(_) => "Ran command",
-            None => "Running command",
-        };
         if let Some(first) = cmd_lines.next() {
             lines.push(Line::from(vec![
-                format!("⚡ {running_str} ").magenta(),
+                "⚡ Running ".to_string().magenta(),
                 first.to_string().into(),
             ]));
         } else {
-            lines.push(Line::from(format!("⚡ {running_str}").magenta()));
+            lines.push(Line::from("⚡ Running".to_string().magenta()));
         }
         for cont in cmd_lines {
             lines.push(Line::from(cont.to_string()));
@@ -1319,9 +1310,9 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
     Line::from(invocation_spans)
 }
 
-fn formatted_list_str(items: Vec<String>, if_empty: &str) -> String {
+fn formatted_list_str(items: Vec<String>) -> String {
     match items.len() {
-        0 => if_empty.to_string(),
+        0 => "".to_string(),
         1 => items[0].clone(),
         2 => format!("{} and {}", items[0], items[1]),
         _ => {
