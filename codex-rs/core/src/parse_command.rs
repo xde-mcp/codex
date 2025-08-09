@@ -712,7 +712,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 let p = non_flags.first().map(|s| short_display_path(s));
                 (None, p)
             } else {
-                let q = non_flags.first().map(|s| short_display_path(s));
+                let q = non_flags.first().cloned().map(|s| s.to_string());
                 let p = non_flags.get(1).map(|s| short_display_path(s));
                 (q, p)
             };
@@ -1471,6 +1471,81 @@ mod tests {
                     "exec/src/event_processor_with_human_output.rs",
                 ]),
                 name: "event_processor_with_human_output.rs".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn preserves_rg_with_spaces() {
+        assert_parsed(
+            &vec_str(&["yes", "|", "rg", "-n", "foo bar", "-S"]),
+            vec![ParsedCommand::Search {
+                cmd: vec_str(&["rg", "-n", "foo bar", "-S"]),
+                query: Some("foo bar".to_string()),
+                path: None,
+                files_only: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn ls_with_glob() {
+        assert_parsed(
+            &vec_str(&["ls", "-I", "*.test.js"]),
+            vec![ParsedCommand::Ls {
+                cmd: vec_str(&["ls", "-I", "*.test.js"]),
+                path: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn trim_on_semicolon() {
+        assert_parsed(
+            &vec_str(&["rg", "foo", ";", "echo", "done"]),
+            vec![
+                ParsedCommand::Search {
+                    cmd: vec_str(&["rg", "foo"]),
+                    query: Some("foo".to_string()),
+                    path: None,
+                    files_only: false,
+                },
+                ParsedCommand::Unknown {
+                    cmd: vec_str(&["echo", "done"]),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn shorten_path_on_windows() {
+        assert_parsed(
+            &vec_str(&["cat", r#"pkg\src\main.rs"#]),
+            vec![ParsedCommand::Read {
+                cmd: vec_str(&["cat", r#"pkg\src\main.rs"#]),
+                name: "main.rs".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn head_with_no_space() {
+        assert_parsed(
+            &vec_str(&["bash", "-lc", "head -n50 Cargo.toml"]),
+            vec![ParsedCommand::Read {
+                cmd: shlex_split("head -n50 Cargo.toml").unwrap(),
+                name: "Cargo.toml".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn tail_with_no_space() {
+        assert_parsed(
+            &vec_str(&["bash", "-lc", "tail -n+10 README.md"]),
+            vec![ParsedCommand::Read {
+                cmd: shlex_split("tail -n+10 README.md").unwrap(),
+                name: "README.md".to_string(),
             }],
         );
     }
