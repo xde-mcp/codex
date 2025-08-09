@@ -40,6 +40,14 @@ pub enum ParsedCommand {
     },
 }
 
+/// Parses metadata out of an arbitrary command.
+/// These commands are model driven and could include just about anything.
+/// The parsing is slightly lossy due to the ~infinite expressiveness of an arbitrary command.
+/// The goal of the parsed metadata is to be able to provide the user with a human readable gis
+/// of what it is doing.
+///
+/// This parsing code is quite complex and not easy to hand-modify.
+/// The easiest way to iterate is to add unit tests and have Codex fix the implementation.
 pub fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
     let normalized = normalize_tokens(command);
 
@@ -62,19 +70,22 @@ pub fn parse_command(command: &[String]) -> Vec<ParsedCommand> {
     // If a pipeline ends with `nl` using only flags (e.g., `| nl -ba`), drop it so the
     // main action (e.g., a sed range over a file) is surfaced cleanly.
     if parsed.len() >= 2 {
-        parsed.retain(|pc| {
-            match pc {
-                ParsedCommand::Unknown { cmd } => {
-                    if let Some(first) = cmd.first() {
-                        if first == "nl" {
-                            // Treat `nl` without an explicit file operand as formatting-only.
-                            return cmd.iter().skip(1).any(|a| !a.starts_with('-'));
-                        }
+        let has_and_and = normalized.iter().any(|t| t == "&&");
+        parsed.retain(|pc| match pc {
+            ParsedCommand::Unknown { cmd } => {
+                if let Some(first) = cmd.first() {
+                    // Drop cosmetic echo segments in chained commands
+                    if has_and_and && first == "echo" {
+                        return false;
                     }
-                    true
+                    if first == "nl" {
+                        // Treat `nl` without an explicit file operand as formatting-only.
+                        return cmd.iter().skip(1).any(|a| !a.starts_with('-'));
+                    }
                 }
-                _ => true,
+                true
             }
+            _ => true,
         });
     }
 
@@ -246,7 +257,9 @@ fn collect_non_flag_targets(args: &[String]) -> Option<Vec<String>> {
 }
 
 fn parse_cargo_test_filter(args: &[String]) -> Option<Vec<String>> {
-    let mut out: Vec<String> = Vec::new();
+    // Collect package selectors separately from explicit test filters.
+    let mut packages: Vec<String> = Vec::new();
+    let mut filters: Vec<String> = Vec::new();
     let mut skip_next = false;
     for (i, a) in args.iter().enumerate() {
         if a == "--" {
@@ -258,7 +271,7 @@ fn parse_cargo_test_filter(args: &[String]) -> Option<Vec<String>> {
         }
         if a == "-p" || a == "--package" {
             if let Some(val) = args.get(i + 1) {
-                out.push(val.clone());
+                packages.push(val.clone());
             }
             if i + 1 < args.len() {
                 skip_next = true;
@@ -267,7 +280,7 @@ fn parse_cargo_test_filter(args: &[String]) -> Option<Vec<String>> {
         }
         if let Some(rest) = a.strip_prefix("--package=") {
             if !rest.is_empty() {
-                out.push(rest.to_string());
+                packages.push(rest.to_string());
             }
             continue;
         }
@@ -280,9 +293,16 @@ fn parse_cargo_test_filter(args: &[String]) -> Option<Vec<String>> {
         if a.starts_with('-') {
             continue;
         }
-        out.push(a.clone());
+        // Non-flag positional arguments are test filters (e.g., module:: or test_name)
+        filters.push(a.clone());
     }
-    if out.is_empty() { None } else { Some(out) }
+    if !filters.is_empty() {
+        Some(filters)
+    } else if !packages.is_empty() {
+        Some(packages)
+    } else {
+        None
+    }
 }
 
 fn parse_pytest_filters(args: &[String]) -> Option<Vec<String>> {
@@ -805,13 +825,11 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 let mut candidates: Vec<&String> = Vec::new();
                 let mut i = 0;
                 while i < tail.len() {
-                    if i == 0 && tail[i] == "-n" {
-                        if i + 1 < tail.len() {
-                            let n = &tail[i + 1];
-                            if n.chars().all(|c| c.is_ascii_digit()) {
-                                i += 2;
-                                continue;
-                            }
+                    if i == 0 && tail[i] == "-n" && i + 1 < tail.len() {
+                        let n = &tail[i + 1];
+                        if n.chars().all(|c| c.is_ascii_digit()) {
+                            i += 2;
+                            continue;
                         }
                     }
                     candidates.push(&tail[i]);
@@ -848,14 +866,12 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 let mut candidates: Vec<&String> = Vec::new();
                 let mut i = 0;
                 while i < tail.len() {
-                    if i == 0 && tail[i] == "-n" {
-                        if i + 1 < tail.len() {
-                            let n = &tail[i + 1];
-                            let s = n.strip_prefix('+').unwrap_or(n);
-                            if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
-                                i += 2;
-                                continue;
-                            }
+                    if i == 0 && tail[i] == "-n" && i + 1 < tail.len() {
+                        let n = &tail[i + 1];
+                        let s = n.strip_prefix('+').unwrap_or(n);
+                        if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                            i += 2;
+                            continue;
                         }
                     }
                     candidates.push(&tail[i]);
@@ -1220,6 +1236,27 @@ mod tests {
                     files_only: true,
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn echo_then_cargo_test_sequence() {
+        assert_parsed(
+            &vec_str(&[
+                "echo",
+                "Running",
+                "tests...",
+                "&&",
+                "cargo",
+                "test",
+                "--all-features",
+                "--quiet",
+            ]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["cargo", "test", "--all-features", "--quiet"]),
+                runner: Some("cargo".to_string()),
+                test_filter: None,
+            }],
         );
     }
 
@@ -1624,6 +1661,25 @@ mod tests {
     }
 
     #[test]
+    fn split_on_or_connector() {
+        // Ensure we split commands on the logical OR operator as well.
+        assert_parsed(
+            &vec_str(&["rg", "foo", "||", "echo", "done"]),
+            vec![
+                ParsedCommand::Search {
+                    cmd: vec_str(&["rg", "foo"]),
+                    query: Some("foo".to_string()),
+                    path: None,
+                    files_only: false,
+                },
+                ParsedCommand::Unknown {
+                    cmd: vec_str(&["echo", "done"]),
+                },
+            ],
+        );
+    }
+
+    #[test]
     fn shorten_path_on_windows() {
         assert_parsed(
             &vec_str(&["cat", r#"pkg\src\main.rs"#]),
@@ -1652,6 +1708,195 @@ mod tests {
             vec![ParsedCommand::Read {
                 cmd: shlex_split("tail -n+10 README.md").unwrap(),
                 name: "README.md".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn pnpm_test_is_parsed_as_test() {
+        assert_parsed(
+            &vec_str(&["pnpm", "test"]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["pnpm", "test"]),
+                runner: Some("pnpm-script".to_string()),
+                test_filter: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn pnpm_exec_vitest_is_unknown() {
+        // From commands_combined: cd codex-cli && pnpm exec vitest run tests/... --threads=false --passWithNoTests
+        let inner = "cd codex-cli && pnpm exec vitest run tests/file-tag-utils.test.ts --threads=false --passWithNoTests";
+        assert_parsed(
+            &vec_str(&["bash", "-lc", inner]),
+            vec![
+                ParsedCommand::Unknown {
+                    cmd: vec_str(&[
+                        "pnpm",
+                        "exec",
+                        "vitest",
+                        "run",
+                        "tests/file-tag-utils.test.ts",
+                        "--threads=false",
+                        "--passWithNoTests",
+                    ]),
+                },
+                ParsedCommand::Unknown {
+                    cmd: vec_str(&["cd", "codex-cli"]),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn cargo_test_with_crate() {
+        assert_parsed(
+            &vec_str(&["cargo", "test", "-p", "codex-core", "parse_command::"]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["cargo", "test", "-p", "codex-core", "parse_command::"]),
+                runner: Some("cargo".to_string()),
+                test_filter: Some(vec_str(&["parse_command::"])),
+            }],
+        );
+    }
+
+    // Additional coverage for other common tools/frameworks
+    #[test]
+    fn recognizes_black_and_ruff() {
+        // black formats Python code
+        assert_parsed(
+            &vec_str(&["black", "src"]),
+            vec![ParsedCommand::Format {
+                cmd: vec_str(&["black", "src"]),
+                tool: Some("black".to_string()),
+                targets: Some(vec!["src".to_string()]),
+            }],
+        );
+
+        // ruff check is a linter; ensure we collect targets
+        assert_parsed(
+            &vec_str(&["ruff", "check", "."]),
+            vec![ParsedCommand::Lint {
+                cmd: vec_str(&["ruff", "check", "."]),
+                tool: Some("ruff".to_string()),
+                targets: Some(vec![".".to_string()]),
+            }],
+        );
+
+        // ruff format is a formatter
+        assert_parsed(
+            &vec_str(&["ruff", "format", "pkg/"]),
+            vec![ParsedCommand::Format {
+                cmd: vec_str(&["ruff", "format", "pkg/"]),
+                tool: Some("ruff".to_string()),
+                targets: Some(vec!["pkg/".to_string()]),
+            }],
+        );
+    }
+
+    #[test]
+    fn recognizes_pnpm_monorepo_test_and_npm_format_script() {
+        // pnpm -r test in a monorepo should still parse as a test action
+        assert_parsed(
+            &vec_str(&["pnpm", "-r", "test"]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["pnpm", "-r", "test"]),
+                runner: Some("pnpm-script".to_string()),
+                test_filter: None,
+            }],
+        );
+
+        // npm run format should be recognized as a format action
+        assert_parsed(
+            &vec_str(&["npm", "run", "format", "--", "-w", "."]),
+            vec![ParsedCommand::Format {
+                cmd: vec_str(&["npm", "run", "format", "--", "-w", "."]),
+                tool: Some("npm-script:format".to_string()),
+                targets: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn pytest_file_only_and_go_run_regex() {
+        // pytest invoked with a file path should be captured as a filter
+        assert_parsed(
+            &vec_str(&["pytest", "tests/test_example.py"]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["pytest", "tests/test_example.py"]),
+                runner: Some("pytest".to_string()),
+                test_filter: Some(vec!["tests/test_example.py".to_string()]),
+            }],
+        );
+
+        // go test with -run regex should capture the filter
+        assert_parsed(
+            &vec_str(&["go", "test", "./...", "-run", "^TestFoo$"]),
+            vec![ParsedCommand::Test {
+                cmd: vec_str(&["go", "test", "./...", "-run", "^TestFoo$"]),
+                runner: Some("go".to_string()),
+                test_filter: Some(vec!["^TestFoo$".to_string()]),
+            }],
+        );
+    }
+
+    #[test]
+    fn grep_with_query_and_path() {
+        assert_parsed(
+            &vec_str(&["grep", "-R", "TODO", "src"]),
+            vec![ParsedCommand::Search {
+                cmd: vec_str(&["grep", "-R", "TODO", "src"]),
+                query: Some("TODO".to_string()),
+                path: Some("src".to_string()),
+                files_only: false,
+            }],
+        );
+    }
+
+    #[test]
+    fn cat_with_double_dash_and_sed_ranges() {
+        // cat -- <file> should be treated as a read of that file
+        assert_parsed(
+            &vec_str(&["cat", "--", "./-strange-file-name"]),
+            vec![ParsedCommand::Read {
+                cmd: vec_str(&["cat", "--", "./-strange-file-name"]),
+                name: "-strange-file-name".to_string(),
+            }],
+        );
+
+        // sed -n <range> <file> should be treated as a read of <file>
+        assert_parsed(
+            &vec_str(&["sed", "-n", "12,20p", "Cargo.toml"]),
+            vec![ParsedCommand::Read {
+                cmd: vec_str(&["sed", "-n", "12,20p", "Cargo.toml"]),
+                name: "Cargo.toml".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn drop_trailing_nl_in_pipeline() {
+        // When an `nl` stage has only flags, it should be dropped from the summary
+        assert_parsed(
+            &vec_str(&["rg", "--files", "|", "nl", "-ba"]),
+            vec![ParsedCommand::Search {
+                cmd: vec_str(&["rg", "--files"]),
+                query: None,
+                path: None,
+                files_only: true,
+            }],
+        );
+    }
+
+    #[test]
+    fn ls_with_time_style_and_path() {
+        assert_parsed(
+            &vec_str(&["ls", "--time-style=long-iso", "./dist"]),
+            vec![ParsedCommand::Ls {
+                cmd: vec_str(&["ls", "--time-style=long-iso", "./dist"]),
+                // short_display_path drops "dist" and shows "." as the last useful segment
+                path: Some(".".to_string()),
             }],
         );
     }

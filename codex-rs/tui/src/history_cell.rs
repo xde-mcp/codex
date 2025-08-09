@@ -381,7 +381,6 @@ impl HistoryCell {
         search_commands: &[ParsedCommand],
         output: Option<&CommandOutput>,
     ) -> Vec<Line<'static>> {
-        tracing::error!("[GABE] new_search_command {:?}", search_commands);
         let file_names: HashSet<&String> = search_commands
             .iter()
             .flat_map(|c| match c {
