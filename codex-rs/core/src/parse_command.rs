@@ -110,12 +110,12 @@ fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
 fn normalize_tokens(cmd: &[String]) -> Vec<String> {
     match cmd {
         [first, pipe, rest @ ..] if (first == "yes" || first == "y") && pipe == "|" => {
-            let s = rest.join(" ");
-            shlex_split(&s).unwrap_or_else(|| rest.to_vec())
+            // Do not re-shlex already-tokenized input; just drop the prefix.
+            rest.to_vec()
         }
         [first, pipe, rest @ ..] if (first == "no" || first == "n") && pipe == "|" => {
-            let s = rest.join(" ");
-            shlex_split(&s).unwrap_or_else(|| rest.to_vec())
+            // Do not re-shlex already-tokenized input; just drop the prefix.
+            rest.to_vec()
         }
         [bash, flag, script] if bash == "bash" && (flag == "-c" || flag == "-lc") => {
             shlex_split(script)
@@ -152,7 +152,7 @@ fn split_on_connectors(tokens: &[String]) -> Vec<Vec<String>> {
 fn trim_at_connector(tokens: &[String]) -> Vec<String> {
     let idx = tokens
         .iter()
-        .position(|t| t == "|" || t == "&&" || t == "||")
+        .position(|t| t == "|" || t == "&&" || t == "||" || t == ";")
         .unwrap_or(tokens.len());
     tokens[..idx].to_vec()
 }
@@ -163,6 +163,7 @@ fn trim_at_connector(tokens: &[String]) -> Vec<String> {
 /// - foo/src/ -> foo
 /// - packages/app/node_modules/ -> app
 fn short_display_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
     let mut parts = path.split('/').rev().filter(|p| {
         !p.is_empty() && *p != "build" && *p != "dist" && *p != "node_modules" && *p != "src"
     });
@@ -170,6 +171,38 @@ fn short_display_path(path: &str) -> String {
         .next()
         .map(|s| s.to_string())
         .unwrap_or_else(|| path.to_string())
+}
+
+// Skip values consumed by specific flags and ignore --flag=value style arguments.
+fn skip_flag_values<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<&'a String> {
+    let mut out: Vec<&'a String> = Vec::new();
+    let mut skip_next = false;
+    for (i, a) in args.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "--" {
+            // From here on, everything is positional operands; push the rest and break.
+            for rest in &args[i + 1..] {
+                out.push(rest);
+            }
+            break;
+        }
+        if a.starts_with("--") && a.contains('=') {
+            // --flag=value form: treat as a flag taking a value; skip entirely.
+            continue;
+        }
+        if flags_with_vals.contains(&a.as_str()) {
+            // This flag consumes the next argument as its value.
+            if i + 1 < args.len() {
+                skip_next = true;
+            }
+            continue;
+        }
+        out.push(a);
+    }
+    out
 }
 
 fn collect_non_flag_targets(args: &[String]) -> Option<Vec<String>> {
@@ -560,20 +593,6 @@ fn maybe_collapse_cat_sed(
 fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
     match main_cmd.split_first() {
         // (sed-specific logic handled below in dedicated arm returning Read)
-        Some((head, tail)) if head == "nl" => {
-            let path = tail.iter().find(|p| !p.starts_with('-'));
-            if let Some(p) = path {
-                let name = short_display_path(p);
-                ParsedCommand::Read {
-                    cmd: main_cmd.to_vec(),
-                    name,
-                }
-            } else {
-                ParsedCommand::Unknown {
-                    cmd: main_cmd.to_vec(),
-                }
-            }
-        }
         Some((head, tail))
             if head == "cargo" && tail.first().map(|s| s.as_str()) == Some("fmt") =>
         {
@@ -692,8 +711,21 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if head == "ls" => {
-            let path = tail
-                .iter()
+            // Avoid treating option values as paths (e.g., ls -I "*.test.js").
+            let candidates = skip_flag_values(
+                tail,
+                &[
+                    "-I",
+                    "-w",
+                    "--block-size",
+                    "--format",
+                    "--time-style",
+                    "--color",
+                    "--quoting-style",
+                ],
+            );
+            let path = candidates
+                .into_iter()
                 .find(|p| !p.starts_with('-'))
                 .map(|p| short_display_path(p));
             ParsedCommand::Ls {
@@ -757,29 +789,103 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
                 }
             }
         }
-        Some((head, tail))
-            if head == "head"
-                && tail.len() >= 3
-                && tail[0] == "-n"
-                && tail[1].chars().all(|c| c.is_ascii_digit()) =>
-        {
-            let name = short_display_path(&tail[2]);
-            ParsedCommand::Read {
+        Some((head, tail)) if head == "head" => {
+            // Support `head -n 50 file` and `head -n50 file` forms.
+            let has_valid_n = match tail.split_first() {
+                Some((first, rest)) if first == "-n" => rest
+                    .first()
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())),
+                Some((first, _)) if first.starts_with("-n") => {
+                    first[2..].chars().all(|c| c.is_ascii_digit())
+                }
+                _ => false,
+            };
+            if has_valid_n {
+                // Build candidates skipping the numeric value consumed by `-n` when separated.
+                let mut candidates: Vec<&String> = Vec::new();
+                let mut i = 0;
+                while i < tail.len() {
+                    if i == 0 && tail[i] == "-n" {
+                        if i + 1 < tail.len() {
+                            let n = &tail[i + 1];
+                            if n.chars().all(|c| c.is_ascii_digit()) {
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                    candidates.push(&tail[i]);
+                    i += 1;
+                }
+                if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
+                    let name = short_display_path(p);
+                    return ParsedCommand::Read {
+                        cmd: main_cmd.to_vec(),
+                        name,
+                    };
+                }
+            }
+            ParsedCommand::Unknown {
                 cmd: main_cmd.to_vec(),
-                name,
             }
         }
-        Some((head, tail))
-            if head == "tail" && tail.len() >= 3 && tail[0] == "-n" && {
-                let n = &tail[1];
-                let s = n.strip_prefix('+').unwrap_or(n);
-                !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-            } =>
-        {
-            let name = short_display_path(&tail[2]);
-            ParsedCommand::Read {
+        Some((head, tail)) if head == "tail" => {
+            // Support `tail -n +10 file` and `tail -n+10 file` forms.
+            let has_valid_n = match tail.split_first() {
+                Some((first, rest)) if first == "-n" => rest.first().is_some_and(|n| {
+                    let s = n.strip_prefix('+').unwrap_or(n);
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                }),
+                Some((first, _)) if first.starts_with("-n") => {
+                    let v = &first[2..];
+                    let s = v.strip_prefix('+').unwrap_or(v);
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                }
+                _ => false,
+            };
+            if has_valid_n {
+                // Build candidates skipping the numeric value consumed by `-n` when separated.
+                let mut candidates: Vec<&String> = Vec::new();
+                let mut i = 0;
+                while i < tail.len() {
+                    if i == 0 && tail[i] == "-n" {
+                        if i + 1 < tail.len() {
+                            let n = &tail[i + 1];
+                            let s = n.strip_prefix('+').unwrap_or(n);
+                            if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                    candidates.push(&tail[i]);
+                    i += 1;
+                }
+                if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
+                    let name = short_display_path(p);
+                    return ParsedCommand::Read {
+                        cmd: main_cmd.to_vec(),
+                        name,
+                    };
+                }
+            }
+            ParsedCommand::Unknown {
                 cmd: main_cmd.to_vec(),
-                name,
+            }
+        }
+        Some((head, tail)) if head == "nl" => {
+            // Avoid treating option values as paths (e.g., nl -s "  ").
+            let candidates = skip_flag_values(tail, &["-s", "-w", "-v", "-i", "-b"]);
+            if let Some(p) = candidates.into_iter().find(|p| !p.starts_with('-')) {
+                let name = short_display_path(p);
+                ParsedCommand::Read {
+                    cmd: main_cmd.to_vec(),
+                    name,
+                }
+            } else {
+                ParsedCommand::Unknown {
+                    cmd: main_cmd.to_vec(),
+                }
             }
         }
         Some((head, tail))
